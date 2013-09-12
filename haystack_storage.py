@@ -47,7 +47,6 @@ class HaystackSlave:
         self.last_fileno = 0
         self.waiting = False
 
-
 def make_fileid(groupid, fileno):
     return (groupid<<54)|fileno
 
@@ -55,40 +54,49 @@ def parse_fileid(fileid):
     fileno = fileid & ((1<<54)-1)
     groupid = fileid>>54
     return (groupid, fileno)
-    
-def handle_client(sock):
-    while True:
-        rds, _, _ = select.select([sock], [], [], 60*5)
-        if not rds:
-            break
-        try:
-            keepalived = handle_request(sock)
-            if not keepalived:
-                break
-        except socket.error:
-            break
-    logging.debug("close client")
-    sock.close()
+
+def handle_sync_upload(sock, parser):
+    logging.debug("handle sync upload")
+    body = parser.recv_body()
+    if not body:
+        return False
+    headers = parser.get_headers()
+    fileno = int(headers["FileNO"]) if headers.has_key("FileNO") else 0
+    if fileno <= haystack.haystack_last_fileno:
+        logging.error("fileno:%d less than %d", \
+                          fileno, haystack.haystack_last_fileno)
+        return False
+
+    if fileno - haystack.haystack_last_fileno != 1:
+        logging.error("fileno is't continuous fileno:%d, last_fileno:%d", \
+                          fileno, haystack.haystack_last_fileno)
+
+    needle = haystack.Needle()
+    needle.data = body
+    needle.key = fileno
+    offset = needle.write()
+    haystack.haystack_files[needle.key] = (offset, len(body))
+    haystack.haystack_last_fileno = fileno
+    logging.debug("fileno:%d", fileno)
+
+    for slave in slaves:
+        if slave.waiting:
+            slave.channel.put(haystack.haystack_last_fileno)
+    if track.waiting:
+        track.channel.put(haystack.haystack_last_fileno)
+
+    return True
 
 def handle_upload(sock, parser):
-    while not parser.is_message_complete():
-        data = sock.recv(64*1024)
-        if not data:
-            logging.warn("client sock closed")
-            return False
-        recved = len(data)
-        nparsed = parser.execute(data, recved)
-        assert(nparsed == recved)
-
     body = parser.recv_body()
     if not body:
         return False
 
-    haystack.haystack_last_fileno += 1
     needle = haystack.Needle()
     needle.data = body
-    needle.key = haystack.haystack_last_fileno
+    needle.key = haystack.haystack_last_fileno+1
     offset = needle.write()
+    haystack.haystack_last_fileno += 1
     haystack.haystack_files[needle.key] = (offset, len(body))
     fileid = make_fileid(groupid, haystack.haystack_last_fileno)
     logging.debug("fileid:%d fileno:%d", fileid, haystack.haystack_last_fileno)
@@ -130,7 +138,7 @@ def handle_download(sock, parser):
         sendfile(sock.fileno(), haystack.haystack_file.fileno(), offset+haystack.Needle.HEADER_SIZE, size)
 
     return bool(keepalived)
-
+    
 def heartbeat(sock):
     ip, port = sock.getpeername()
     parser = HttpParser()
@@ -154,30 +162,20 @@ def post_file(sock, fileno):
     if not haystack.haystack_files.has_key(fileno):
         logging.error("can't find file:%d", fileno)
         return False
-    offset, size = haystack.haystack_files[fileno]
 
+    offset, size = haystack.haystack_files[fileno]
     logging.debug("post file:%d size:%d", fileno, size)
-    parser = HttpParser()
-    sock.send("POST /upload HTTP/1.1\r\n")
+
+    sock.send("POST /sync_upload HTTP/1.1\r\n")
     sock.send("Host: %s:%d\r\n"%(ip, port))
     sock.send("Content-Length: %d\r\n"%size)
     sock.send("Content-Type: application/octet-stream\r\n")
     sock.send("Connection: keep-alive\r\n")
+    sock.send("FileNO: %d\r\n"%fileno)
     sock.send("\r\n")
-    sendfile(sock.fileno(), haystack.haystack_file.fileno(), offset+haystack.Needle.HEADER_SIZE, size)
-
-    while True:
-      data = sock.recv(1024)
-      if not data:
-          return False
-
-      recved = len(data)
-      nparsed = parser.execute(data, recved)
-      assert(nparsed == recved)
-      if parser.is_message_complete():
-          break
-
-    return parser.get_status_code() == 200
+    sendfile(sock.fileno(), haystack.haystack_file.fileno(), \
+                 offset+haystack.Needle.HEADER_SIZE, size)
+    return True
 
 def handle_sync(sock, parser):
     logging.debug("handle sync")
@@ -201,7 +199,6 @@ def handle_sync(sock, parser):
         while True:
             while slave.last_fileno < haystack.haystack_last_fileno:
                 if not post_file(sock, slave.last_fileno+1):
-                    logging.debug("1111111111111")
                     return False
                 slave.last_fileno += 1
             try:
@@ -209,7 +206,6 @@ def handle_sync(sock, parser):
                 slave.channel.get(timeout=5)
             except queue.Empty:
                 if not heartbeat(sock):
-                    logging.debug("22222222222222")
                     return False
             finally:
                 slave.waiting = False
@@ -241,35 +237,48 @@ def handle_ping(sock, parser):
     logging.debug("handle ping")
     return "pong"
     
-def handle_request(sock):
-    parser = HttpParser()
-    while True:
-        logging.debug("recv........")
-        data = sock.recv(1024)
-        if not data:
-            logging.warn("client sock closed")
-            return False
-        recved = len(data)
-        nparsed = parser.execute(data, recved)
-        assert(nparsed == recved)
-        if parser.is_headers_complete():
-            break
-
-    leave_body = ["/upload"]
-    if parser.get_path() not in leave_body:
-        while not parser.is_message_complete():
-            logging.debug("recv body")
-            data = sock.recv(1024)
+def handle_request(sock, parser, preread):
+    logging.debug("handle request")
+    if parser:
+        assert(parser.is_headers_complete())
+        headers = parser.get_headers()
+        content_length = int(headers["Content-Length"]) if headers.has_key("Content-Length") else 0
+        assert(content_length >= len(preread))
+        if content_length:
+            if preread:
+                nparsed = parser.execute(preread, len(preread))
+                assert(nparsed == len(preread))
+                content_length -= len(preread)
+            while content_length:
+                data = sock.recv(content_length)
+                if not data:
+                    logging.warn("client sock closed")
+                    return False
+                recved = len(data)
+                content_length -= recved
+                nparsed = parser.execute(data, recved)
+                assert(nparsed == recved)
+                if parser.is_message_complete():
+                    break
+    else:
+        parser = HttpParser()
+        while True:
+            logging.debug("recv........")
+            data = sock.recv(64*1024)
             if not data:
                 logging.warn("client sock closed")
                 return False
             recved = len(data)
             nparsed = parser.execute(data, recved)
             assert(nparsed == recved)
-        
+            if parser.is_message_complete():
+                break
+
     obj = None
     if parser.get_path() == "/upload":
         obj = handle_upload(sock, parser)
+    elif parser.get_path() == "/sync_upload":
+        obj = handle_sync_upload(sock, parser)
     elif parser.get_path() == "/download":
         obj = handle_download(sock, parser)
     elif parser.get_path() == "/sync":
@@ -308,6 +317,56 @@ def handle_request(sock):
     else:
         return obj
 
+def handle_client(sock):
+    try:
+        while True:
+            rds, _, _ = select.select([sock], [], [], 60*5)
+            if not rds:
+                break
+
+            keepalived = handle_request(sock, None, None)
+            if not keepalived:
+                break
+    except socket.error, e:
+        logging.debug("socket error:%r", e)
+    finally:
+        logging.debug("close client")
+        sock.close()
+    
+def handle_batch_client(sock):
+    recvbuf = ""
+    while True:
+        rds, _, _ = select.select([sock], [], [], 60*5)
+        if not rds:
+            break
+
+        data = sock.recv(1024)
+        if not data:
+            break
+        recvbuf += data
+        
+        pos = recvbuf.find("\r\n\r\n")
+        if pos == -1:
+            continue
+        parser = HttpParser()
+        nparsed = parser.execute(recvbuf, pos+4)
+        if nparsed != pos+4:
+            logging.debug("pos:%d, nparsed:%d, recvbuf:%r", pos, nparsed, recvbuf)
+        assert(nparsed == pos+4)
+        assert(parser.is_headers_complete())
+        headers = parser.get_headers()
+        content_length = int(headers["Content-Length"]) if headers.has_key("Content-Length") else 0
+        logging.debug("content length:%d", content_length)
+        recvbuf = recvbuf[pos+4:]
+        preread = recvbuf[:content_length]
+        recvbuf = recvbuf[content_length:]
+        keepalived = handle_request(sock, parser, preread)
+        if not keepalived:
+            break
+
+    logging.debug("close client")
+    sock.close()
+
 def post_sync(sock, masterip, masterport):
     obj = {"last_fileno":haystack.haystack_last_fileno}
     body = json.dumps(obj)
@@ -340,16 +399,19 @@ def _sync(masterip, masterport):
     if not post_sync(sock, masterip, masterport):
         return
     logging.debug("slave sync begin recv...")
-    handle_client(sock)
-
+    handle_batch_client(sock)
+  
 def sync_with_master(masterip, masterport):
     while True:
         try:
             logging.debug("sync........")
             _sync(masterip, masterport)
-        except socket.error:
+        except socket.error, e:
+            logging.debug("disconnect with master, exception:%r", e)
             gevent.sleep(5)
-            logging.debug("disconnect with master")
+        except Exception, e:
+            logging.debug("sync exception:%r", e)
+            gevent.sleep(5)
 
 def post_report(sock):
     obj = {}
@@ -404,7 +466,11 @@ def track_report():
                     continue
                 finally:
                     track.waiting = False
-        except socket.error:
+        except socket.error, e:
+            logging.debug("socket error:%r", e)
+        except Exception, e:
+            logging.debug("exception:%r", e)
+        finally:
             track.state = TRACK_OFFLINE
             sock.close()
             if nseconds == 0:
@@ -413,7 +479,7 @@ def track_report():
                 gevent.sleep(nseconds)
                 if nseconds < 10:
                     nseconds *= 2
-            logging.debug("disconnect with track")
+            logging.debug("disconnect with track")          
 
 def file_exists(path):
     try:

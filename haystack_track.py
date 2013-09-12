@@ -200,26 +200,27 @@ def handle_request(sock):
         return obj
 
 def handle_client(sock):
-    while True:
-        rds, _, _ = select.select([sock], [], [], 60*5)
-        if not rds:
-            break
-        try:
+    try:
+        while True:
+            rds, _, _ = select.select([sock], [], [], 60*5)
+            if not rds:
+                break
             keepalived = handle_request(sock)
             if not keepalived:
                 break
-        except socket.error:
-            break
-    logging.debug("close client")
-    if hasattr(sock, "node"):
-        node = sock.node
-        groupnodes[node.groupid].remove(node)
-        if masternodes.has_key(node.groupid) and \
-                masternodes[node.groupid] == node:
-            masternodes.pop(node.groupid)
-        sock.node = None
-    sock.close()
+    except socket.error, e:
+        logging.debug("socket error:%r", e)
+    finally:
+        logging.debug("close client")
+        if hasattr(sock, "node"):
+            node = sock.node
+            groupnodes[node.groupid].remove(node)
+            if masternodes.has_key(node.groupid) and \
+                    masternodes[node.groupid] == node:
+                masternodes.pop(node.groupid)
+            sock.node = None
 
+        sock.close()
 
 def main():
     haystack_logging.init_logger("track", logging.DEBUG)
