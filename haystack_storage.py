@@ -1,4 +1,5 @@
 import sys
+import os
 import gevent
 import gevent.socket as socket
 import gevent.select as select
@@ -19,6 +20,8 @@ except ImportError:
 import haystack
 import haystack_logging
 
+haystack_path = ""
+haystack_index_path = ""
 groupid = 0
 listenip = ""
 listenport = 0
@@ -414,11 +417,12 @@ def sync_with_master(masterip, masterport):
             gevent.sleep(5)
 
 def post_report(sock):
+    st = os.statvfs(haystack_path)
+    available_size = st.f_bavail * st.f_frsize
     obj = {}
     obj["listenip"] = listenip
     obj["listenport"] = listenport
-    GB = 1024*1024*1024
-    obj["disk_available_size"] = GB+1
+    obj["disk_available_size"] = available_size
     obj["master"] = master
     obj["groupid"] = groupid
     obj["last_fileno"] = haystack.haystack_last_fileno
@@ -493,6 +497,7 @@ def main():
     global listenip, listenport
     global track, masterip, masterport
     global groupid, master
+    global haystack_path, haystack_index_path
     haystack_logging.init_logger("storage", logging.DEBUG)
 
     config = {}
