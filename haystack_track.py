@@ -93,7 +93,7 @@ def handle_request_readable_node(sock, parser):
     args = urlparse.parse_qs(parser.get_query_string())
     if not args.has_key("fileid"):
         return False
-    fildid = args["fileid"][0]
+    fileid = int(args["fileid"][0])
     groupid, fileno = parse_fileid(fileid)
     if not groupnodes.has_key(groupid):
         return False
@@ -106,22 +106,23 @@ def handle_request_readable_node(sock, parser):
         rnodes.append(masternodes[groupid])
     if not rnodes:
         return False
-    i = random.randint(len(rnodes)-1)
+    i = random.randint(0, len(rnodes)-1)
     node = rnodes[i]
     obj = {"ip":node.listenip, "port":node.listenport}
     return obj
 
 def handle_request_writable_node(sock, parser):
+    logging.debug("handle request writable node")
     wnodes = []
     for groupid in masternodes:
-        node = masterndoes[groupid]
+        node = masternodes[groupid]
         GB = 1024*1024*1024
         if node.disk_available_size > GB:
             wnodes.append(node)
 
     if not wnodes:
         return False
-    i = random.randint(len(wnodes)-1)
+    i = random.randint(0, len(wnodes)-1)
     node = wnodes[i]
     obj = {"ip":node.listenip, "port":node.listenport}
     return obj
@@ -142,6 +143,7 @@ def handle_info(sock, parser):
             o["groupid"] = node.groupid
             o["listenip"] = node.listenip
             o["listenport"] = node.listenport
+            o["disk_free"] = node.disk_available_size
             obj.append(o)
 
     return obj
