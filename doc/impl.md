@@ -126,7 +126,7 @@ slave send sync request to master
 **body:**
 ```js
 {
-"last_fileno:int
+"last_fileno":int
 }
 ```
 **response:**200
